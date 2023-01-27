@@ -2,7 +2,6 @@
 using System.Runtime.CompilerServices;
 using CriFs.V2.Hook.Bind;
 using CriFs.V2.Hook.Bind.Utilities;
-using CriFs.V2.Hook.Configuration;
 using CriFs.V2.Hook.CRI;
 using CriFs.V2.Hook.Hooks;
 using CriFs.V2.Hook.Interfaces;
@@ -10,12 +9,11 @@ using CriFs.V2.Hook.Template;
 using CriFs.V2.Hook.Utilities;
 using CriFsV2Lib.Definitions;
 using FileEmulationFramework.Lib.Utilities;
-using p5rpc.modloader;
-using p5rpc.modloader.Patches.Common;
 using Reloaded.Hooks.ReloadedII.Interfaces;
 using Reloaded.Memory.SigScan.ReloadedII.Interfaces;
 using Reloaded.Mod.Interfaces;
 using Reloaded.Mod.Interfaces.Internal;
+using Native = CriFs.V2.Hook.Utilities.Native;
 
 [module: SkipLocalsInit]
 namespace CriFs.V2.Hook;
@@ -42,11 +40,6 @@ public class Mod : ModBase, IExports // <= Do not Remove.
     private readonly Logger _logger;
 
     /// <summary>
-    /// Entry point into the mod, instance that created this class.
-    /// </summary>
-    private readonly IMod _owner;
-
-    /// <summary>
     /// Provides access to this mod's configuration.
     /// </summary>
     private Config _configuration;
@@ -58,14 +51,12 @@ public class Mod : ModBase, IExports // <= Do not Remove.
     
     private ReloadedBindBuilderCreator? _cpkBuilder;
     private BindDirectoryAcquirer _directoryAcquirer;
-    private SigScanHelper _scanHelper;
-    private CpkContentCache _cpkContentCache;
-    
+
     public Mod(ModContext context)
     {
         _modLoader = context.ModLoader;
         _hooks = context.Hooks;
-        _owner = context.Owner;
+        var owner = context.Owner;
         _configuration = context.Configuration;
         _modConfig = context.ModConfig;
         _logger = new Logger(context.Logger, _configuration.LogLevel);
@@ -77,7 +68,7 @@ public class Mod : ModBase, IExports // <= Do not Remove.
         // and some other neat features, override the methods in ModBase.
 
         _modLoader.GetController<IStartupScanner>().TryGetTarget(out var startupScanner);
-        _scanHelper = new SigScanHelper(_logger, startupScanner);
+        var scanHelper = new SigScanHelper(_logger, startupScanner);
         var currentProcess = Process.GetCurrentProcess();
         var mainModule = currentProcess.MainModule;
         var baseAddr = mainModule!.BaseAddress;
@@ -88,11 +79,11 @@ public class Mod : ModBase, IExports // <= Do not Remove.
             Config = _configuration,
             Logger = _logger,
             Hooks = _hooks!,
-            ScanHelper = _scanHelper
+            ScanHelper = scanHelper
         };
         
         // Patches
-        CpkBinderPointers.Init(_scanHelper, baseAddr);
+        CpkBinderPointers.Init(scanHelper, baseAddr);
         DontLogCriDirectoryBinds.Activate(hookContext);
         
         // CPK Builder & Redirector
@@ -100,17 +91,17 @@ public class Mod : ModBase, IExports // <= Do not Remove.
         var currentProcessProvider = new CurrentProcessProvider(currentProcess.Id);
         var processListProvider = new ProcessListProvider();
         
-        _cpkContentCache = new CpkContentCache();
+        var cpkContentCache = new CpkContentCache();
         _directoryAcquirer = new BindDirectoryAcquirer(modConfigDirectory, currentProcessProvider, processListProvider);
-        _cpkBuilder = new ReloadedBindBuilderCreator(_modLoader, _logger, _directoryAcquirer, _cpkContentCache);
+        _cpkBuilder = new ReloadedBindBuilderCreator(_modLoader, _logger, _directoryAcquirer, cpkContentCache);
         _cpkBuilder.SetHotReload(_configuration.HotReload);
         _modLoader.OnModLoaderInitialized += OnLoaderInitialized;
         _modLoader.ModLoaded += OnModLoaded;
         _modLoader.ModUnloading += OnModUnloaded;
         
         // Add API
-        _modLoader.AddOrReplaceController<ICriFsRedirectorApi>(_owner, 
-            new Api(_cpkBuilder, _cpkContentCache, mainModule.FileName, currentProcessProvider, processListProvider));
+        _modLoader.AddOrReplaceController<ICriFsRedirectorApi>(owner, 
+            new Api(_cpkBuilder, cpkContentCache, mainModule.FileName, currentProcessProvider, processListProvider));
     }
 
     // In case user loads mod in real time.
@@ -129,9 +120,32 @@ public class Mod : ModBase, IExports // <= Do not Remove.
     private void OnLoaderInitialized()
     {
         _modLoader.OnModLoaderInitialized -= OnLoaderInitialized;
+        AssertAwbIncompatibility();
         CpkBinder.Init(_directoryAcquirer.BindDirectory, _logger, _hooks!);
         CpkBinder.SetPrintFileAccess(_configuration.PrintFileAccess);
         _cpkBuilder?.Build(); 
+    }
+
+    private void AssertAwbIncompatibility()
+    {
+        // We messed up and didn't properly set up updates in extension mod,
+        // so we assert its sufficiently recent.
+        var mods = _modLoader.GetActiveMods();
+        var minVersion = new Version(1, 0, 5);
+        foreach (var mod in mods)
+        {
+            var modConfig = mod.Generic;
+            if (modConfig.ModId != "CriFs.V2.Hook.Awb")
+                continue;
+
+            if (new Version(modConfig.ModVersion) < minVersion)
+                Native.MessageBox(0, "Version of AWB Emulator Extension is out of Date.\n" +
+                                     "If you're seeing this message you most likely have an older version that has misconfigured update support and thus cannot receive updates.\n\n" +
+                                     "Select 'AWB Emulator Support for CRI FileSystem V2 Hook' in Launcher, click Open Folder and delete all files.\n" +
+                                     "Newer version will redownload on next game launch, thanks!", "We did an oopsie!", 0);
+                
+            return;
+        }
     }
 
     #region Standard Overrides
@@ -143,7 +157,7 @@ public class Mod : ModBase, IExports // <= Do not Remove.
         _logger.LogLevel = _configuration.LogLevel;
         _logger.Info($"[{_modConfig.ModId}] Config Updated: Applying");
         CpkBinder.SetPrintFileAccess(_configuration.PrintFileAccess);
-        _cpkBuilder.SetHotReload(_configuration.HotReload);
+        _cpkBuilder?.SetHotReload(_configuration.HotReload);
     }
     #endregion
 
